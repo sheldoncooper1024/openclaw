@@ -13,7 +13,7 @@ import {
 } from "openclaw/plugin-sdk";
 import { resolveFeishuAccount } from "./accounts.js";
 import { createFeishuClient } from "./client.js";
-import { tryRecordMessagePersistent } from "./dedup.js";
+import { tryRecordMessage, tryRecordMessagePersistent } from "./dedup.js";
 import { maybeCreateDynamicAgent } from "./dynamic-agent.js";
 import { normalizeFeishuExternalKey } from "./external-keys.js";
 import { downloadMessageResourceFeishu } from "./media.js";
@@ -168,6 +168,7 @@ export type FeishuMessageEvent = {
     chat_type: "p2p" | "group";
     message_type: string;
     content: string;
+    create_time?: string;
     mentions?: Array<{
       key: string;
       id: {
@@ -453,14 +454,19 @@ async function resolveFeishuMediaList(params: {
   const out: FeishuMediaInfo[] = [];
   const core = getFeishuRuntime();
 
-  // Handle post (rich text) messages with embedded images
+  // Handle post (rich text) messages with embedded images/media.
   if (messageType === "post") {
-    const { imageKeys } = parsePostContent(content);
-    if (imageKeys.length === 0) {
+    const { imageKeys, mediaKeys: postMediaKeys } = parsePostContent(content);
+    if (imageKeys.length === 0 && postMediaKeys.length === 0) {
       return [];
     }
 
-    log?.(`feishu: post message contains ${imageKeys.length} embedded image(s)`);
+    if (imageKeys.length > 0) {
+      log?.(`feishu: post message contains ${imageKeys.length} embedded image(s)`);
+    }
+    if (postMediaKeys.length > 0) {
+      log?.(`feishu: post message contains ${postMediaKeys.length} embedded media file(s)`);
+    }
 
     for (const imageKey of imageKeys) {
       try {
@@ -494,6 +500,40 @@ async function resolveFeishuMediaList(params: {
         log?.(`feishu: downloaded embedded image ${imageKey}, saved to ${saved.path}`);
       } catch (err) {
         log?.(`feishu: failed to download embedded image ${imageKey}: ${String(err)}`);
+      }
+    }
+
+    for (const media of postMediaKeys) {
+      try {
+        const result = await downloadMessageResourceFeishu({
+          cfg,
+          messageId,
+          fileKey: media.fileKey,
+          type: "file",
+          accountId,
+        });
+
+        let contentType = result.contentType;
+        if (!contentType) {
+          contentType = await core.media.detectMime({ buffer: result.buffer });
+        }
+
+        const saved = await core.channel.media.saveMediaBuffer(
+          result.buffer,
+          contentType,
+          "inbound",
+          maxBytes,
+        );
+
+        out.push({
+          path: saved.path,
+          contentType: saved.contentType,
+          placeholder: "<media:video>",
+        });
+
+        log?.(`feishu: downloaded embedded media ${media.fileKey}, saved to ${saved.path}`);
+      } catch (err) {
+        log?.(`feishu: failed to download embedded media ${media.fileKey}: ${String(err)}`);
       }
     }
 
@@ -653,8 +693,15 @@ export async function handleFeishuMessage(params: {
   const log = runtime?.log ?? console.log;
   const error = runtime?.error ?? console.error;
 
-  // Dedup check: skip if this message was already processed (memory + disk).
+  // Dedup: synchronous memory guard prevents concurrent duplicate dispatch
+  // before the async persistent check completes.
   const messageId = event.message.message_id;
+  const memoryDedupeKey = `${account.accountId}:${messageId}`;
+  if (!tryRecordMessage(memoryDedupeKey)) {
+    log(`feishu: skipping duplicate message ${messageId} (memory dedup)`);
+    return;
+  }
+  // Persistent dedup survives restarts and reconnects.
   if (!(await tryRecordMessagePersistent(messageId, account.accountId, log))) {
     log(`feishu: skipping duplicate message ${messageId}`);
     return;
@@ -742,6 +789,10 @@ export async function handleFeishuMessage(params: {
   const useAccessGroups = cfg.commands?.useAccessGroups !== false;
 
   if (isGroup) {
+    if (groupConfig?.enabled === false) {
+      log(`feishu[${account.accountId}]: group ${ctx.chatId} is disabled`);
+      return;
+    }
     const defaultGroupPolicy = resolveDefaultGroupPolicy(cfg);
     const { groupPolicy, providerMissingFallbackApplied } = resolveOpenProviderRuntimeGroupPolicy({
       providerConfigPresent: cfg.channels?.feishu !== undefined,
@@ -766,7 +817,9 @@ export async function handleFeishuMessage(params: {
     });
 
     if (!groupAllowed) {
-      log(`feishu[${account.accountId}]: sender ${ctx.senderOpenId} not in group allowlist`);
+      log(
+        `feishu[${account.accountId}]: group ${ctx.chatId} not in groupAllowFrom (groupPolicy=${groupPolicy})`,
+      );
       return;
     }
 
@@ -998,10 +1051,10 @@ export async function handleFeishuMessage(params: {
       ? `Feishu[${account.accountId}] message in group ${ctx.chatId}`
       : `Feishu[${account.accountId}] DM from ${ctx.senderOpenId}`;
 
-    core.system.enqueueSystemEvent(`${inboundLabel}: ${preview}`, {
-      sessionKey: route.sessionKey,
-      contextKey: `feishu:message:${ctx.chatId}:${ctx.messageId}`,
-    });
+    // Do not enqueue inbound user previews as system events.
+    // System events are prepended to future prompts and can be misread as
+    // authoritative transcript turns.
+    log(`feishu[${account.accountId}]: ${inboundLabel}: ${preview}`);
 
     // Resolve media from message
     const mediaMaxBytes = (feishuCfg?.mediaMaxMb ?? 30) * 1024 * 1024; // 30MB default
@@ -1090,6 +1143,10 @@ export async function handleFeishuMessage(params: {
       Body: combinedBody,
       BodyForAgent: messageBody,
       InboundHistory: inboundHistory,
+      // Quote/reply message support: use standard ReplyToId for parent,
+      // and pass root_id for thread reconstruction.
+      ReplyToId: ctx.parentId,
+      RootMessageId: ctx.rootId,
       RawBody: ctx.content,
       CommandBody: ctx.content,
       From: feishuFrom,
@@ -1112,6 +1169,11 @@ export async function handleFeishuMessage(params: {
       ...mediaPayload,
     });
 
+    // Parse message create_time (Feishu uses millisecond epoch string).
+    const messageCreateTimeMs = event.message.create_time
+      ? parseInt(event.message.create_time, 10)
+      : undefined;
+
     const { dispatcher, replyOptions, markDispatchIdle } = createFeishuReplyDispatcher({
       cfg,
       agentId: route.agentId,
@@ -1123,6 +1185,7 @@ export async function handleFeishuMessage(params: {
       rootId: ctx.rootId,
       mentionTargets: ctx.mentionTargets,
       accountId: account.accountId,
+      messageCreateTimeMs,
     });
 
     log(`feishu[${account.accountId}]: dispatching to agent (session=${route.sessionKey})`);
